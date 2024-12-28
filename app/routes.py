@@ -2,19 +2,32 @@ from flask import Blueprint, request, jsonify
 from .models import User, Lista, Item
 from . import db
 from datetime import datetime
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import joinedload
+
 
 main = Blueprint("main", __name__)
+from flask_cors import cross_origin
 
 
 @main.route("/api/users", methods=["POST"])
-def create_user():
+@cross_origin()
+def register_user():
     data = request.json
-    new_user = User(
-        nome=data.get("nome"), telefone=data.get("telefone"), email=data.get("email")
-    )
-    db.session.add(new_user)
+    nome = data.get("nome", "").strip()
+    telefone = data.get("telefone", "").strip()
+    email = data.get("email", "").strip()
+    senha = data.get("senha", "").strip()
+
+    if User.query.filter_by(email=email).first():
+        return jsonify({"error": "Email já registrado"}), 400
+
+    user = User(nome=nome, telefone=telefone, email=email)
+    user.set_senha(senha)  # Define o hash da senha
+    db.session.add(user)
     db.session.commit()
-    return jsonify({"message": "Usuário criado com sucesso!"}), 201
+
+    return jsonify({"message": "Usuário registrado com sucesso!"}), 201
 
 
 @main.route("/api/users", methods=["GET"])
@@ -36,69 +49,132 @@ def get_users():
     )
 
 
+@main.route("/api/login", methods=["POST"])
+@cross_origin()
+def login_user():
+    # Obtendo dados da requisição JSON enviada pelo frontend
+    data = request.json
+    nome = data.get("nome", "").strip()  # Nome enviado pelo usuário
+    telefone = data.get("telefone", "").strip()  # Telefone enviado pelo usuário
+
+    # Verifica no banco de dados se existe um usuário com o nome e telefone fornecidos
+    user = User.query.filter_by(nome=nome, telefone=telefone).first()
+
+    if user:
+        # Retorna sucesso com o nome do usuário
+        return (
+            jsonify(
+                {"message": "Login bem-sucedido!", "nome": user.nome, "id": user.id}
+            ),
+            200,
+        )
+    else:
+        # Retorna erro se o usuário não for encontrado
+        return jsonify({"error": "Usuário não encontrado ou dados incorretos"}), 404
+
+
 @main.route("/api/listas", methods=["POST"])
+@cross_origin()
 def criar_lista():
     """
     Cria uma nova lista de compras associada a um usuário.
     """
     data = request.json
     user_id = data.get("userId")
-    data_criacao = data.get("data")  # Aceitar a data enviada pelo frontend
+    data_criacao = data.get("data")
     itens_data = data.get("itens", [])
 
+    # Validação de campos obrigatórios
     if not user_id or not itens_data:
-        return jsonify({"error": "Campos obrigatórios estão faltando."}), 400
-
-    # Criação da lista com a data enviada pelo frontend
-    nova_lista = Lista(user_id=user_id, data=datetime.fromisoformat(data_criacao))
-    for item in itens_data:
-        novo_item = Item(
-            produto=item["produto"],
-            valor=item["valor"],
-            quantidade=item["quantidade"],
-            supermercado=item["supermercado"],
-            lista=nova_lista,
+        return (
+            jsonify({"error": "Campos obrigatórios estão faltando: userId ou itens"}),
+            400,
         )
-        db.session.add(novo_item)
 
-    db.session.add(nova_lista)
-    db.session.commit()
-    return (
-        jsonify({"message": "Lista criada com sucesso!", "listaId": nova_lista.id}),
-        201,
-    )
+    try:
+        # Criação da lista
+        nova_lista = Lista(user_id=user_id, data=datetime.fromisoformat(data_criacao))
+
+        for item in itens_data:
+            # Validação de cada item
+            if not all(
+                k in item for k in ("produto", "valor", "quantidade", "supermercado")
+            ):
+                return jsonify({"error": "Dados do item incompletos."}), 400
+
+            novo_item = Item(
+                produto=item["produto"],
+                valor=item["valor"],
+                quantidade=item["quantidade"],
+                supermercado=item["supermercado"],
+                lista=nova_lista,
+            )
+            db.session.add(novo_item)
+
+        # Salva a lista e os itens
+        db.session.add(nova_lista)
+        db.session.commit()
+
+        return (
+            jsonify({"message": "Lista criada com sucesso!", "listaId": nova_lista.id}),
+            201,
+        )
+
+    except ValueError:
+        return jsonify({"error": "Formato de data inválido. Use ISO 8601."}), 400
+    except SQLAlchemyError as e:
+        db.session.rollback()  # Reverte qualquer alteração em caso de erro
+        return jsonify({"error": f"Erro no banco de dados: {str(e)}"}), 500
 
 
 @main.route("/api/listas", methods=["GET"])
+@cross_origin()
 def listar_listas():
     """
-    Retorna todas as listas de compras cadastradas, incluindo o nome do usuário.
+    Retorna as listas de compras de um usuário específico, incluindo o nome do usuário.
     """
-    listas = Lista.query.all()
-    return (
-        jsonify(
-            [
-                {
-                    "id": lista.id,
-                    "userId": lista.user_id,
-                    "userNome": lista.user.nome,  # Incluímos o nome do usuário
-                    "data": lista.data.isoformat(),
-                    "itens": [
-                        {
-                            "id": item.id,
-                            "produto": item.produto,
-                            "valor": item.valor,
-                            "quantidade": item.quantidade,
-                            "supermercado": item.supermercado,
-                        }
-                        for item in lista.itens
-                    ],
-                }
-                for lista in listas
-            ]
-        ),
-        200,
+    user_id = request.args.get("userId")  # Obtém o userId dos parâmetros da URL
+
+    if not user_id:
+        return jsonify({"error": "O parâmetro userId é obrigatório."}), 400
+
+    try:
+        user_id = int(user_id)  # Valida se o userId é um número
+    except ValueError:
+        return jsonify({"error": "O parâmetro userId deve ser um número válido."}), 400
+
+    # Busca as listas associadas ao userId com as relações necessárias
+    listas = (
+        Lista.query.options(joinedload(Lista.itens), joinedload(Lista.user))
+        .filter_by(user_id=user_id)
+        .all()
     )
+
+    if not listas:
+        return jsonify({"message": "Nenhuma lista encontrada para este usuário."}), 404
+
+    # Monta a resposta com as listas do usuário
+    response = [
+        {
+            "id": lista.id,
+            "userId": lista.user_id,
+            "userNome": lista.user.nome if lista.user else None,
+            "data": lista.data.isoformat(),
+            "itens": [
+                {
+                    "id": item.id,
+                    "produto": item.produto,
+                    "valor": item.valor,
+                    "quantidade": item.quantidade,
+                    "supermercado": item.supermercado,
+                }
+                for item in lista.itens
+            ],
+        }
+        for lista in listas
+    ]
+
+    return jsonify(response), 200
 
 
 @main.route("/api/listas/<int:lista_id>", methods=["PUT"])
@@ -138,12 +214,16 @@ def atualizar_lista(lista_id):
 
 @main.route("/api/listas/<int:lista_id>", methods=["DELETE"])
 def excluir_lista(lista_id):
-    """
-    Exclui uma lista existente e todos os seus itens.
-    """
-    lista = Lista.query.get_or_404(lista_id)
+    print(f"Recebendo requisição DELETE para excluir lista com ID: {lista_id}")
+
+    lista = Lista.query.get(lista_id)
+
+    if not lista:
+        return jsonify({"error": "Lista não encontrada"}), 404
+
     db.session.delete(lista)
     db.session.commit()
+
     return jsonify({"message": "Lista excluída com sucesso!"}), 200
 
 
